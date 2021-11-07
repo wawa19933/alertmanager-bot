@@ -229,6 +229,7 @@ func (b *Bot) isAdminID(id int) bool {
 
 // Run the telegram and listen to messages send to the telegram.
 func (b *Bot) Run(ctx context.Context, webhooks <-chan alertmanager.TelegramWebhook) error {
+	b.telegram.Handle(telebot.OnAddedToGroup, b.middleware(b.handleStart))
 	b.telegram.Handle(CommandStart, b.middleware(b.handleStart))
 	b.telegram.Handle(CommandStop, b.middleware(b.handleStop))
 	b.telegram.Handle(CommandHelp, b.middleware(b.handleHelp))
@@ -329,20 +330,35 @@ func (b *Bot) handleStart(message *telebot.Message) error {
 		return err
 	}
 
-	level.Info(b.logger).Log(
-		"msg", "user subscribed",
-		"username", message.Sender.Username,
-		"user_id", message.Sender.ID,
-		"chat_id", message.Chat.ID,
-	)
+	var err error
+	switch message.Chat.Type {
+	case telebot.ChatPrivate:
+		level.Info(b.logger).Log(
+			"msg", "user subscribed",
+			"username", message.Sender.Username,
+			"user_id", message.Sender.ID,
+			"chat_id", message.Chat.ID,
+		)
+		_, err = b.telegram.Send(message.Chat, fmt.Sprintf(responseStartPrivate, message.Sender.FirstName))
 
-	if message.Chat.Type == telebot.ChatPrivate {
-		_, err := b.telegram.Send(message.Chat, fmt.Sprintf(responseStartPrivate, message.Sender.FirstName))
-		return err
-	} else {
-		_, err := b.telegram.Send(message.Chat, responseStartGroup)
-		return err
+	case telebot.ChatGroup, telebot.ChatSuperGroup:
+		level.Info(b.logger).Log(
+			"msg", "group subscribed",
+			"chat", message.Chat.Title,
+			"description", message.Chat.Description,
+			"chat_id", message.Chat.ID,
+		)
+		_, err = b.telegram.Send(message.Chat, responseStartGroup)
+
+	default:
+		level.Warn(b.logger).Log("msg", "unsupported chat type", "chat", message.Chat.Title, "type", message.Chat.Type, "id", message.Chat.ID)
+		if err := b.chats.Remove(message.Chat); err != nil {
+			level.Error(b.logger).Log("msg", "cannot remove chat from store", "error", err)
+		}
+		return errors.New("unsupported chat type: " + string(message.Chat.Type))
 	}
+
+	return err
 }
 
 func (b *Bot) handleStop(message *telebot.Message) error {
