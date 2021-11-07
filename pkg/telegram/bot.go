@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net/url"
@@ -104,10 +105,12 @@ func NewBot(chats BotChatStore, token string, admin int, opts ...BotOption) (*Bo
 		Timeout: 10 * time.Second,
 	}
 
-	bot, err := telebot.NewBot(telebot.Settings{
-		Token:  token,
-		Poller: poller,
-	})
+	bot, err := telebot.NewBot(
+		telebot.Settings{
+			Token:  token,
+			Poller: poller,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -217,8 +220,17 @@ func WithExtraAdmins(ids ...int) BotOption {
 }
 
 // SendAdminMessage to the admin's ID with a message.
-func (b *Bot) SendAdminMessage(adminID int, message string) {
-	_, _ = b.telegram.Send(&telebot.User{ID: adminID}, message)
+func (b *Bot) SendAdminMessage(what interface{}, option ...interface{}) (*telebot.Message, error) {
+	id := b.admins[0]
+	for _, opt := range option {
+		if n, ok := opt.(int); ok {
+			id = n
+		}
+	}
+	if id != 0 {
+		return b.telegram.Send(&telebot.User{ID: id}, what, option...)
+	}
+	return nil, nil
 }
 
 // isAdminID returns whether id is one of the configured admin IDs.
@@ -227,8 +239,84 @@ func (b *Bot) isAdminID(id int) bool {
 	return i < len(b.admins) && b.admins[i] == id
 }
 
+func takeCommand(text string) string {
+	a := strings.SplitN(text, " ", 2)
+	a = strings.SplitN(a[0], "@", 2)
+	return a[0]
+}
+
+func confirm(b *Bot, next func(*telebot.Chat, *telebot.User) error) func(cm *telebot.ChatMemberUpdated) {
+	return func(cm *telebot.ChatMemberUpdated) {
+		if cm.NewChatMember != nil && cm.NewChatMember.Role == telebot.Left {
+			_ = b.chats.Remove(&cm.Chat)
+			return
+		}
+		bot := b.telegram.(*telebot.Bot)
+		handleCommand := func(chat *telebot.Chat, user *telebot.User) {
+			if err := next(chat, user); err != nil {
+				level.Warn(b.logger).Log("msg", "failed to handle command", "err", err)
+			}
+		}
+
+		confirmation := &telebot.ReplyMarkup{}
+		approve := confirmation.Data("Yes", "yes")
+		reject := confirmation.Data("No", "no")
+		confirmation.Inline(confirmation.Row(approve, reject))
+
+		message, err := b.SendAdminMessage(
+			fmt.Sprintf(
+				"The bot is added to group '%s'.\n\nDo you allow it to subscribe for notifications?",
+				cm.Chat.Title,
+			),
+			confirmation,
+		)
+		if err != nil {
+			return
+		}
+
+		bot.Handle(
+			&approve, func(c *telebot.Callback) {
+				level.Info(b.logger).Log("msg", "subscription request approved by admin", "group", cm.Chat.Title)
+				_, err := bot.Edit(message, readLine(message.Text)+"\n\nApproved")
+				if err != nil {
+					level.Warn(b.logger).Log("msg", "cannot edit confirmation message", "error", err)
+				}
+				handleCommand(&cm.Chat, &cm.From)
+
+				err = bot.Respond(
+					c, &telebot.CallbackResponse{
+						CallbackID: approve.CallbackUnique(),
+					},
+				)
+				if err != nil {
+					level.Warn(b.logger).Log("msg", "failed to send callback response", "error", err)
+				}
+			},
+		)
+		bot.Handle(
+			&reject, func(c *telebot.Callback) {
+				level.Warn(b.logger).Log("msg", "subscription request was rejected by admin", "group", cm.Chat.Title)
+				_, err := bot.Edit(message, readLine(message.Text)+"\n\nDeclined")
+				if err != nil {
+					level.Warn(b.logger).Log("msg", "cannot edit confirmation message", "error", err)
+				}
+				err = bot.Respond(
+					c, &telebot.CallbackResponse{
+						CallbackID: reject.CallbackUnique(),
+					},
+				)
+				if err != nil {
+					level.Warn(b.logger).Log("msg", "failed to send callback response", "error", err)
+				}
+			},
+		)
+	}
+}
+
 // Run the telegram and listen to messages send to the telegram.
 func (b *Bot) Run(ctx context.Context, webhooks <-chan alertmanager.TelegramWebhook) error {
+	b.telegram.Handle(telebot.OnChatMember, confirm(b, b.start))
+	b.telegram.Handle(telebot.OnMyChatMember, confirm(b, b.start))
 	b.telegram.Handle(telebot.OnAddedToGroup, b.middleware(b.handleStart))
 	b.telegram.Handle(CommandStart, b.middleware(b.handleStart))
 	b.telegram.Handle(CommandStop, b.middleware(b.handleStop))
@@ -241,18 +329,22 @@ func (b *Bot) Run(ctx context.Context, webhooks <-chan alertmanager.TelegramWebh
 
 	var gr run.Group
 	{
-		gr.Add(func() error {
-			return b.sendWebhook(ctx, webhooks)
-		}, func(err error) {
-		})
+		gr.Add(
+			func() error {
+				return b.sendWebhook(ctx, webhooks)
+			}, func(err error) {
+			},
+		)
 	}
 	{
-		gr.Add(func() error {
-			b.telegram.Start()
-			return nil
-		}, func(err error) {
-			b.telegram.Stop()
-		})
+		gr.Add(
+			func() error {
+				b.telegram.Start()
+				return nil
+			}, func(err error) {
+				b.telegram.Stop()
+			},
+		)
 	}
 
 	return gr.Run()
@@ -268,7 +360,14 @@ func (b *Bot) sendWebhook(ctx context.Context, webhooks <-chan alertmanager.Tele
 			chat, err := b.chats.Get(telebot.ChatID(w.ChatID))
 			if err != nil {
 				if errors.Is(err, ChatNotFoundErr) {
-					level.Warn(b.logger).Log("msg", "chat is not subscribed for alerts", "chat_id", w.ChatID, "err", err)
+					level.Warn(b.logger).Log(
+						"msg",
+						"chat is not subscribed for alerts",
+						"chat_id",
+						w.ChatID,
+						"err",
+						err,
+					)
 					continue
 				}
 				return err
@@ -304,7 +403,15 @@ func (b *Bot) middleware(next func(*telebot.Message) error) func(*telebot.Messag
 		if m.IsService() {
 			return
 		}
-		if !b.isAdminID(m.Sender.ID) && m.Text != CommandID {
+
+		handleCommand := func(m *telebot.Message) {
+			if err := next(m); err != nil {
+				level.Warn(b.logger).Log("msg", "failed to handle command", "err", err)
+			}
+		}
+		command := takeCommand(m.Text)
+
+		if !b.isAdminID(m.Sender.ID) && command != CommandID && command != CommandStart {
 			level.Info(b.logger).Log(
 				"msg", "dropping message from forbidden sender",
 				"sender_id", m.Sender.ID,
@@ -313,52 +420,69 @@ func (b *Bot) middleware(next func(*telebot.Message) error) func(*telebot.Messag
 			return
 		}
 
-		command := strings.Split(m.Text, " ")[0]
 		b.commandEvents(command)
 
 		level.Debug(b.logger).Log("msg", "message received", "text", m.Text)
-		if err := next(m); err != nil {
-			level.Warn(b.logger).Log("msg", "failed to handle command", "err", err)
-		}
+		handleCommand(m)
 	}
 }
 
-func (b *Bot) handleStart(message *telebot.Message) error {
-	if err := b.chats.Add(message.Chat); err != nil {
+func readLine(text string) string {
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	for scanner.Scan() {
+		return scanner.Text()
+	}
+	return text
+}
+
+func (b *Bot) start(chat *telebot.Chat, sender *telebot.User) error {
+	if err := b.chats.Add(chat); err != nil {
 		level.Warn(b.logger).Log("msg", "failed to add chat to chat store", "err", err)
-		_, err = b.telegram.Send(message.Chat, "I can't add this chat to the subscribers list.")
+		_, err = b.telegram.Send(chat, "I can't add this chat to the subscribers list.")
 		return err
 	}
 
 	var err error
-	switch message.Chat.Type {
+	switch chat.Type {
 	case telebot.ChatPrivate:
 		level.Info(b.logger).Log(
 			"msg", "user subscribed",
-			"username", message.Sender.Username,
-			"user_id", message.Sender.ID,
-			"chat_id", message.Chat.ID,
+			"username", sender.Username,
+			"user_id", sender.ID,
+			"chat_id", chat.ID,
 		)
-		_, err = b.telegram.Send(message.Chat, fmt.Sprintf(responseStartPrivate, message.Sender.FirstName))
+		_, err = b.telegram.Send(chat, fmt.Sprintf(responseStartPrivate, sender.FirstName))
 
 	case telebot.ChatGroup, telebot.ChatSuperGroup:
 		level.Info(b.logger).Log(
 			"msg", "group subscribed",
-			"chat", message.Chat.Title,
-			"description", message.Chat.Description,
-			"chat_id", message.Chat.ID,
+			"chat", chat.Title,
+			"description", chat.Description,
+			"chat_id", chat.ID,
 		)
-		_, err = b.telegram.Send(message.Chat, responseStartGroup)
+		_, err = b.telegram.Send(chat, responseStartGroup)
 
 	default:
-		level.Warn(b.logger).Log("msg", "unsupported chat type", "chat", message.Chat.Title, "type", message.Chat.Type, "id", message.Chat.ID)
-		if err := b.chats.Remove(message.Chat); err != nil {
+		level.Warn(b.logger).Log("msg", "unsupported chat type", "chat", chat.Title, "type", chat.Type, "id", chat.ID)
+		if err := b.chats.Remove(chat); err != nil {
 			level.Error(b.logger).Log("msg", "cannot remove chat from store", "error", err)
 		}
-		return errors.New("unsupported chat type: " + string(message.Chat.Type))
+		return errors.New("unsupported chat type: " + string(chat.Type))
 	}
 
 	return err
+}
+
+func (b *Bot) handleStart(message *telebot.Message) error {
+	if message.FromGroup() {
+		confirm(b, b.start)(&telebot.ChatMemberUpdated{
+			Chat:          *message.Chat,
+			From:          *message.Sender,
+			Unixtime:      message.Unixtime,
+		})
+		return nil
+	}
+	return b.start(message.Chat, message.Sender)
 }
 
 func (b *Bot) handleStop(message *telebot.Message) error {
@@ -397,7 +521,7 @@ func (b *Bot) handleChats(message *telebot.Message) error {
 
 	list := ""
 	for _, chat := range chats {
-		if chat.Type == telebot.ChatGroup {
+		if chat.Type != telebot.ChatPrivate {
 			list = list + fmt.Sprintf("@%s\n", chat.Title)
 		} else {
 			list = list + fmt.Sprintf("@%s\n", chat.Username)
@@ -414,7 +538,10 @@ func (b *Bot) handleID(message *telebot.Message) error {
 		return err
 	}
 
-	_, err := b.telegram.Send(message.Chat, fmt.Sprintf("Your ID is %d\nChat ID is %d", message.Sender.ID, message.Chat.ID))
+	_, err := b.telegram.Send(
+		message.Chat,
+		fmt.Sprintf("Your ID is %d\nChat ID is %d", message.Sender.ID, message.Chat.ID),
+	)
 	return err
 }
 
@@ -453,7 +580,11 @@ func (b *Bot) handleAlerts(message *telebot.Message) error {
 
 	receiver, err := receiverFromConfig(*status.Config.Original, message.Chat.ID)
 	if err != nil || receiver == "" {
-		_, err := b.telegram.Send(message.Chat, fmt.Sprintf(responseAlertsNotConfigured, message.Chat.ID), &telebot.SendOptions{ParseMode: telebot.ModeMarkdown})
+		_, err := b.telegram.Send(
+			message.Chat,
+			fmt.Sprintf(responseAlertsNotConfigured, message.Chat.ID),
+			&telebot.SendOptions{ParseMode: telebot.ModeMarkdown},
+		)
 		return err
 	}
 
@@ -480,9 +611,11 @@ func (b *Bot) handleAlerts(message *telebot.Message) error {
 		return nil
 	}
 
-	_, err = b.telegram.Send(message.Chat, b.truncateMessage(out), &telebot.SendOptions{
-		ParseMode: telebot.ModeHTML,
-	})
+	_, err = b.telegram.Send(
+		message.Chat, b.truncateMessage(out), &telebot.SendOptions{
+			ParseMode: telebot.ModeHTML,
+		},
+	)
 	return err
 }
 
