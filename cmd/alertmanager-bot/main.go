@@ -52,27 +52,27 @@ var (
 )
 
 var cli struct {
-	AlertmanagerURL *url.URL `name:"alertmanager.url" default:"http://localhost:9093/" help:"The URL that's used to connect to the alertmanager"`
-	ListenAddr      string   `name:"listen.addr" default:"0.0.0.0:8080" help:"The address the alertmanager-bot listens on for incoming webhooks"`
-	LogJSON         bool     `name:"log.json" default:"false" help:"Tell the application to log json and not key value pairs"`
-	LogLevel        string   `name:"log.level" default:"info" enum:"error,warn,info,debug" help:"The log level to use for filtering logs"`
-	TemplatePaths   []string `name:"template.paths" default:"/templates/default.tmpl" help:"The paths to the template"`
+	AlertmanagerURL *url.URL `name:"alertmanager.url" default:"http://localhost:9093/"  help:"The URL that's used to connect to the alertmanager" env:"ALERTMANAGER_URL"`
+	ListenAddr      string   `name:"listen.addr" default:"0.0.0.0:8080" help:"The address the alertmanager-bot listens on for incoming webhooks" env:"LISTEN_ADDR"`
+	LogJSON         bool     `name:"log.json" default:"false" help:"Tell the application to log json and not key value pairs" env:"LOG_JSON"`
+	LogLevel        string   `name:"log.level" default:"info" enum:"error,warn,info,debug" help:"The log level to use for filtering logs" env:"LOG_LEVEL"`
+	TemplatePaths   []string `name:"template.paths" default:"default.tmpl" help:"The paths to the template" env:"TEMPLATE_PATHS"`
 
 	cliTelegram
 
-	Store       string `required:"true" name:"store" enum:"bolt,consul,etcd" help:"The store to use"`
-	StorePrefix string `name:"storeKeyPrefix" default:"telegram/chats" help:"Prefix for store keys"`
+	Store       string `required:"true" name:"store" enum:"bolt,consul,etcd" help:"The store to use" env:"STORE"`
+	StorePrefix string `name:"storeKeyPrefix" default:"telegram/chats" help:"Prefix for store keys" env:"STORE_PREFIX"`
 	cliBolt
 	cliConsul
 	cliEtcd
 }
 
 type cliBolt struct {
-	Path string `name:"bolt.path" type:"path" default:"/tmp/bot.db" help:"The path to the file where bolt persists its data"`
+	Path string `name:"bolt.path" type:"path" default:"/tmp/bot.db" help:"The path to the file where bolt persists its data" env:"BOLT_PATH"`
 }
 
 type cliConsul struct {
-	URL *url.URL `name:"consul.url" default:"localhost:8500" help:"The URL that's used to connect to the consul store"`
+	URL *url.URL `name:"consul.url" default:"localhost:8500" help:"The URL that's used to connect to the consul store" env:"CONSUL_URL"`
 }
 
 type cliEtcd struct {
@@ -85,7 +85,7 @@ type cliEtcd struct {
 }
 
 type cliTelegram struct {
-	Admins []int  `required:"true" name:"telegram.admin" help:"The ID of the initial Telegram Admin"`
+	Admins []int  `required:"true" name:"telegram.admin" env:"TELEGRAM_ADMIN" help:"The ID of the initial Telegram Admin"`
 	Token  string `required:"true" name:"telegram.token" env:"TELEGRAM_TOKEN" help:"The token used to connect with Telegram"`
 }
 
